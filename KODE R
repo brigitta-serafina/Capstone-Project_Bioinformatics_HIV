@@ -1,0 +1,400 @@
+# ============================================================
+# Modul: Analisis Ekspresi Gen - HIV Immunological Non-Responders
+# Dataset: GSE113088
+# Referensi: Younes et al., J Clin Invest, 2018
+# "Cycling CD4+ T cells in HIV-infected immune nonresponders
+#  have mitochondrial dysfunction"
+# Platform: Microarray (Affymetrix)
+# Tujuan: Mengidentifikasi Differentially Expressed Genes (DEG)
+#         antara INR vs IR pada HIV-infected individuals
+# ============================================================
+
+# PART A. PENGANTAR KONSEP
+# Analisis ekspresi gen bertujuan membandingkan tingkat ekspresi gen
+# antara dua kondisi biologis:
+# - INR (Immunological Non-Responders): gagal memulihkan CD4+ T cell
+# - IR  (Immunological Responders)    : berhasil memulihkan CD4+ T cell
+# Pendekatan statistik: LIMMA (Linear Models for Microarray Data)
+
+# ============================================================
+# PART B. PERSIAPAN LINGKUNGAN KERJA
+# ============================================================
+
+#1. Cek apakah BiocManager sudah ada, jika belum instal dari CRAN
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+#2. Instal versi dasar Bioconductor
+BiocManager::install(version = "3.20") # Sesuaikan versi dengan R Anda
+.libPaths()
+BiocManager::install("GEOquery", ask = FALSE)
+BiocManager::install("GEOquery")
+BiocManager::install("limmma")
+install.packages("dplyr")
+install.packages(c("ggplot2", "pheatmap", "gplots", "RColorBrewer"))
+BiocManager::install("GenomeInfoDbData", ask = FALSE)
+remove.packages("S4Arrays")
+BiocManager::install("S4Arrays", force = TRUE, ask = FALSE)
+BiocManager::install("GEOquery", force = TRUE, ask = FALSE)
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(gplots)
+library(RColorBrewer)
+
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Package Bioconductor
+BiocManager::install(c("GEOquery", "limma"), ask = FALSE, update = FALSE)
+
+# Annotation package (sesuaikan setelah cek platform GSE113088)
+BiocManager::install("hgu133plus2.db", ask = FALSE, update = FALSE)
+
+# Package CRAN untuk visualisasi
+install.packages(c("pheatmap", "ggplot2", "dplyr"))
+
+if (!requireNamespace("umap", quietly = TRUE)) {
+  install.packages("umap")
+}
+
+# Load semua library
+library(GEOquery)
+library(limma)
+library(umap)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(hgu133plus2.db)
+
+# ============================================================
+# PART C. PENGAMBILAN DATA DARI GEO
+# ============================================================
+
+# GSE113088: Dataset Younes et al. 2018
+# Berisi profil transkriptomik cycling CD4+ T cells dari:
+# - INR: HIV+ gagal memulihkan CD4+ T cell
+# - IR : HIV+ berhasil memulihkan CD4+ T cell
+# - HC : Healthy Controls (opsional sebagai referensi)
+rm(gset)
+getwd()
+list.files(pattern = "GSE106792") 
+library(GEOquery)
+gset <- getGEO(filename = "D:/BIOINFORMATICS RESEARCH/GSE106792_series_matrix.txt.gz")
+
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+# Cek metadata sampel untuk menentukan grup
+# pData(gset) -> lihat kolom "characteristics_ch1" atau "title"
+head(pData(gset)[, c("title", "characteristics_ch1")])
+
+# ============================================================
+# PART D. DEFINISI KELOMPOK SAMPEL
+# ============================================================
+
+# 0 = None_T0 (kontrol awal)
+# 1 = None_T4 (kontrol tanpa treatment)
+# 2 = Silicon_T4 (dengan IL-15)
+
+gsms <- "012012012"  # panjang = 9, sesuai jumlah sampel
+
+sml <- strsplit(gsms, split = "")[[1]]
+
+gs <- factor(sml)
+groups <- make.names(c("None_T0", "None_T4", "Silicon_T4"))
+levels(gs) <- groups
+gset$group <- gs
+
+cat("Kelompok sampel:\n")
+print(table(gs))
+# [1] "INR" -> HIV+ yang gagal memulihkan CD4+
+# [2] "IR"  -> HIV+ yang berhasil memulihkan CD4+
+
+# ============================================================
+# PART E. PRE-PROCESSING DATA EKSPRESI
+# ============================================================
+
+ex <- exprs(gset)
+
+# Log2 transformasi
+# Diperlukan karena data microarray mentah memiliki rentang lebar
+# Log2 FC memudahkan interpretasi: +1 = 2x naik, -1 = 2x turun
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm = TRUE))
+
+LogC <- (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0)
+if (LogC) {
+  ex[which(ex <= 0)] <- NaN
+  exprs(gset) <- log2(ex)
+  cat("Log2 transformasi diterapkan\n")
+} else {
+  cat("Data sudah dalam skala log\n")
+}
+
+# ============================================================
+# PART F. DESIGN MATRIX
+# ============================================================
+
+# Design matrix mendefinisikan struktur eksperimen
+# Kontras utama: INR - IR
+# Positif logFC = gen lebih tinggi pada INR
+# Negatif logFC = gen lebih rendah pada INR (lebih tinggi di IR)
+
+design <- model.matrix(~ group + 0, gset)
+colnames(design) <- levels(gs)
+
+cat("\nDesign matrix (kontras yang dianalisis):\n")
+print(head(design))
+
+gset <- gset[complete.cases(exprs(gset)), ]
+
+# Voom transformation dengan plot mean-variance trend
+v <- vooma(gset, design, plot = TRUE)
+v$genes <- fData(gset)
+
+# ============================================================
+# PART G. ANALISIS DIFFERENTIAL EXPRESSION (LIMMA)
+# ============================================================
+
+fit <- lmFit(v)
+
+# Kontras: INR vs IR
+# Gen dengan logFC positif -> upregulated di INR
+# Gen dengan logFC negatif -> downregulated di INR
+cts <- paste(groups[1], "-", groups[2], sep = "")
+cont.matrix <- makeContrasts(contrasts = cts, levels = design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+
+# Top 250 DEG
+tT <- topTable(fit2, adjust = "fdr", sort.by = "B", number = 250)
+
+# Pilih kolom yang relevan
+# Sesuaikan nama kolom dengan fData yang tersedia di GSE113088
+available_cols <- colnames(tT)
+cat("\nKolom tersedia di tT:\n")
+print(available_cols)
+
+# Simpan hasil
+tT_clean <- tT[, intersect(
+  c("ID", "adj.P.Val", "P.Value", "t", "B", "logFC",
+    "Gene.Symbol", "Gene.title", "GB_ACC"),
+  available_cols
+)]
+
+write.table(tT_clean, file = "DEG_HIV_INR_vs_IR.tsv",
+            row.names = FALSE, sep = "\t")
+cat("\nHasil DEG disimpan: DEG_HIV_INR_vs_IR.tsv\n")
+
+# ============================================================
+# PART H. ANOTASI GEN
+# ============================================================
+cat("Platform:", annotation(gset), "\n")
+
+gpl <- getGEO("GPL24789")
+# Cek kolom yang tersedia
+cat("Kolom GPL24789:\n")
+print(colnames(Table(gpl)))
+head(Table(gpl), 5)
+
+#Platform GPL24789 hanya punya ID dan ORF (berisi Entrez Gene ID), tidak ada Gene Symbol langsung. Kita perlu konversi Entrez ID → Gene Symbol menggunakan org.Hs.eg.db.
+# Install package human genome annotation
+BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+# Ambil ORF (Entrez ID) dari gpl_table
+gpl_table <- Table(gpl)
+
+# Konversi Entrez ID -> Gene Symbol & Gene Name
+entrez_ids <- as.character(gpl_table$ORF)
+
+gene_annotation <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = entrez_ids,
+  columns = c("SYMBOL", "GENENAME"),
+  keytype = "ENTREZID"
+)
+
+# Gabungkan gpl_table dengan anotasi
+gpl_annotated <- merge(
+  gpl_table,
+  gene_annotation,
+  by.x  = "ORF",
+  by.y  = "ENTREZID",
+  all.x = TRUE
+)
+
+cat("Hasil anotasi:\n")
+head(gpl_annotated, 10)
+# ============================================================
+# PART I. VISUALISASI DATA
+# ============================================================
+
+ex <- exprs(gset)
+ord <- order(gs)
+
+# 1. Boxplot distribusi ekspresi 
+palette(c("#D95F02", "#1B9E77"))
+par(mar = c(7, 4, 2, 1))
+title_box <- "GSE113088 - HIV INR vs IR | Distribusi Ekspresi per Sampel"
+boxplot(ex[, ord],
+        boxwex = 0.6, notch = TRUE,
+        main   = title_box,
+        outline = FALSE, las = 2,
+        col  = gs[ord],
+        xlab = "", ylab = "Expression Value (log2)")
+legend("topleft", groups, fill = palette(), bty = "n")
+
+# 2. Density plot 
+par(mar = c(4, 4, 2, 1))
+title_den <- "GSE113088 - Distribusi Nilai Ekspresi Gen"
+plotDensities(ex, group = gs, main = title_den, legend = "topright")
+
+# 3. Histogram p-value 
+tT2 <- topTable(fit2, adjust = "fdr", sort.by = "B", number = Inf)
+hist(tT2$adj.P.Val,
+     col    = "blue", border = "white",
+     xlab   = "Adjusted P-value (FDR)",
+     ylab   = "Jumlah Gen",
+     main   = "Distribusi Adjusted P-value\nHIV INR vs IR (GSE113088)")
+
+# 4. Volcano Plot 
+dT <- decideTests(fit2, adjust.method = "fdr", p.value = 0.05, lfc = 0)
+
+tT2$regulation <- "Not Significant"
+tT2$regulation[tT2$logFC > 0.5  & tT2$adj.P.Val < 0.05] <- "Upregulated (INR)"
+tT2$regulation[tT2$logFC < -0.5 & tT2$adj.P.Val < 0.05] <- "Downregulated (INR)"
+
+ggplot(tT2, aes(x = logFC, y = -log10(adj.P.Val), color = regulation)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c(
+    "Upregulated (INR)"   = "red",
+    "Downregulated (INR)" = "pink",
+    "Not Significant"     = "purple"
+  )) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dashed", color = "black") +
+  labs(
+    title    = "Volcano Plot: HIV INR vs IR",
+    subtitle = "Dataset: GSE113088 | Younes et al., J Clin Invest 2018",
+    x        = "log2 Fold Change (INR/IR)",
+    y        = "-log10(Adjusted P-value)",
+    color    = "Regulasi Gen"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+# 5. Heatmap 50 DEG Teratas ---
+top50 <- head(tT2[order(tT2$adj.P.Val), ], 50)
+top50_probes <- rownames(top50)
+mat_heat <- ex[top50_probes, ord]
+
+# Label baris dengan gene symbol jika tersedia
+row_labels <- ifelse(!is.na(top50$SYMBOL) & top50$SYMBOL != "",
+                     top50$SYMBOL, top50_probes)
+rownames(mat_heat) <- row_labels
+
+annotation_col <- data.frame(Group = gs[ord])
+rownames(annotation_col) <- colnames(mat_heat)
+
+#Cek level grup 
+cat("Level grup:\n")
+print(levels(gs))
+cat("\nIsi annotation_col:\n")
+print(annotation_col)
+
+# Sesuaikan ann_colors dengan 3 level grup
+ann_colors <- list(Group = c(
+  None_T0    = "#D95F02",
+  None_T4    = "#1B9E77",
+  Silicon_T4 = "#2C7BB6"
+))
+
+pheatmap(mat_heat,
+         annotation_col  = annotation_col,
+         annotation_colors = ann_colors,
+         scale           = "row",
+         cluster_cols    = FALSE,
+         cluster_rows    = TRUE,
+         show_colnames   = FALSE,
+         fontsize_row    = 7,
+         main = "Heatmap: 50 DEG Teratas\nHIV INR vs IR (GSE113088)",
+         color = colorRampPalette(c("#2C7BB6", "white", "#D7191C"))(100))
+# 6. UMAP Plot 
+ex_umap <- na.omit(ex)
+ex_umap <- ex_umap[!duplicated(ex_umap), ]
+
+ump <- umap(t(ex_umap), n_neighbors = 8, random_state = 123)
+
+umap_df <- data.frame(
+  UMAP1 = ump$layout[, 1],
+  UMAP2 = ump$layout[, 2],
+  Group = gs
+)
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(
+    breaks = c("None_T0", "None_T4", "Silicon_T4"),
+    values = c("None_T0"    = "#D95F02",
+               "None_T4"    = "#1B9E77",
+               "Silicon_T4" = "#2C7BB6")
+  ) +
+  labs(
+    title    = "UMAP Plot - GSE106792",
+    subtitle = "Pemisahan Sampel Berdasarkan Profil Ekspresi Gen",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold"))
+
+# ============================================================
+# PART J. EKSPOR UNTUK ANALISIS GO & KEGG
+# ============================================================
+
+# Filter DEG signifikan
+sig_DEG <- tT2 %>%
+  filter(adj.P.Val < 0.05, abs(logFC) > 0.5) %>%
+  arrange(adj.P.Val)
+
+upregulated   <- sig_DEG %>% filter(logFC > 0.5)   # lebih tinggi di INR
+downregulated <- sig_DEG %>% filter(logFC < -0.5)   # lebih rendah di INR
+
+cat("\nJumlah DEG signifikan (adj.P.Val < 0.05, |logFC| > 0.5):\n")
+cat("Upregulated di INR  :", nrow(upregulated), "gen\n")
+cat("Downregulated di INR:", nrow(downregulated), "gen\n")
+
+# Simpan daftar gen untuk input g:Profiler / KEGG Mapper
+write.csv(upregulated,   "DEG_upregulated_INR.csv",   row.names = FALSE)
+write.csv(downregulated, "DEG_downregulated_INR.csv",  row.names = FALSE)
+
+# Daftar gene symbol untuk copy-paste ke g:Profiler
+cat("\n--- Gene Symbol UPREGULATED (input g:Profiler) ---\n")
+cat(paste(na.omit(unique(upregulated$SYMBOL)), collapse = "\n"), "\n")
+
+cat("\n--- Gene Symbol DOWNREGULATED (input g:Profiler) ---\n")
+cat(paste(na.omit(unique(downregulated$SYMBOL)), collapse = "\n"), "\n")
+
+# ============================================================
+# CATATAN INTERPRETASI BIOLOGIS
+# ============================================================
+# Berdasarkan Younes et al. 2018, gen-gen kunci yang diharapkan:
+#
+# DOWNREGULATED di INR (disfungsi mitokondria):
+#   - PPARGC1A (PGC1α) : regulator biogenesis mitokondria
+#   - TFAM              : faktor transkripsi mitokondria
+#   - FOXP3             : master regulator sel Treg
+#   - MFN1, MFN2        : fusi mitokondria
+#
+# UPREGULATED di INR (aktivasi & kelelahan sel):
+#   - Ki67 (MKI67)      : marker proliferasi
+#   - Gen apoptosis     : tanda kelelahan CD4+ T cell
+#
+# KEGG Pathway yang diharapkan ter-enriched:
+#   - Oxidative phosphorylation
+#   - T cell receptor signaling pathway
+#   - Th17 cell differentiation
+#   - Apoptosis
+#   - IL-15 signaling (target terapi potensial)
